@@ -1,0 +1,7 @@
+DESIGN.md
+MEMORY.md
+design.md
+memory.md
+__pycache__/
+*/__pycache__/
+*.pyc
