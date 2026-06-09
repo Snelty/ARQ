@@ -7,7 +7,9 @@ OUTPUT_FILE="${OUTPUT_FILE:-/tmp/processes.json}"
 INTERVAL_SECONDS="${INTERVAL_SECONDS:-1}"
 LIMIT="${LIMIT:-40}"
 HOST="${HOST:-127.0.0.1}"
-PORT="${PORT:-8000}"
+# Usa un puerto distinto al launcher Windows para no reutilizar por error
+# un app.py que ya esté escuchando en localhost:8000.
+PORT="${PORT:-8765}"
 URL="http://${HOST}:${PORT}"
 
 find_python() {
@@ -30,6 +32,16 @@ write_process_snapshot() {
     echo "{"
     echo "  \"timestamp\": $timestamp,"
     echo "  \"source\": \"bash-ps\","
+    printf "  \"alive_pids\": ["
+    ps -eo pid= 2>/dev/null | awk '
+      BEGIN { first = 1 }
+      {
+        if (first == 0) printf ","
+        printf "%d", $1
+        first = 0
+      }
+      END { print "]," }
+    '
     echo "  \"processes\": ["
 
     ps -eo pid=,ppid=,pcpu=,rss=,stat=,nlwp=,etime=,user=,comm= --sort=-pcpu 2>/dev/null | head -n "$LIMIT" | awk '
@@ -93,17 +105,35 @@ collect_processes() {
   done
 }
 
-server_is_up() {
+server_has_linux_data() {
   local python_bin="$1"
   "$python_bin" - "$URL/api/processes" <<'PY' >/dev/null 2>&1
+import json
 import sys
 import urllib.request
 
 try:
     with urllib.request.urlopen(sys.argv[1], timeout=1) as response:
-        raise SystemExit(0 if response.status == 200 else 1)
+        payload = json.load(response)
+        raise SystemExit(0 if response.status == 200 and payload.get("source") == "bash-ps" else 1)
 except Exception:
     raise SystemExit(1)
+PY
+}
+
+port_is_available() {
+  local python_bin="$1"
+  "$python_bin" - "$HOST" "$PORT" <<'PY' >/dev/null 2>&1
+import socket
+import sys
+
+sock = socket.socket()
+try:
+    sock.bind((sys.argv[1], int(sys.argv[2])))
+except OSError:
+    raise SystemExit(1)
+finally:
+    sock.close()
 PY
 }
 
@@ -124,11 +154,19 @@ start_dashboard() {
   python_bin="$(find_python)"
 
   write_process_snapshot
-  "$BASH" "$0" collect &
+
+  while ! port_is_available "$python_bin" && ! server_has_linux_data "$python_bin"; do
+    PORT="$((PORT + 1))"
+    URL="http://${HOST}:${PORT}"
+  done
+
+  OUTPUT_FILE="$OUTPUT_FILE" INTERVAL_SECONDS="$INTERVAL_SECONDS" LIMIT="$LIMIT" \
+    "$BASH" "$0" collect &
   collector_pid="$!"
 
-  if ! server_is_up "$python_bin"; then
-    "$python_bin" "$ROOT_DIR/backend/server.py" &
+  if ! server_has_linux_data "$python_bin"; then
+    PROCESS_FILE="$OUTPUT_FILE" HOST="$HOST" PORT="$PORT" \
+      "$python_bin" "$ROOT_DIR/backend/server.py" &
     server_pid="$!"
   else
     server_pid=""

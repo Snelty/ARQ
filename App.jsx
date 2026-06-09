@@ -1,4 +1,7 @@
-const { useEffect, useMemo, useState } = React;
+﻿const { useEffect, useMemo, useRef, useState } = React;
+
+const NEW_PROCESS_MS = 60_000;
+const CLOSED_PROCESS_MS = 30_000;
 
 const TWEAK_DEFAULTS = /*EDITMODE-BEGIN*/{
   "accentColor": "#27D7FF",
@@ -42,6 +45,40 @@ function flatten(node, parent = null, depth = 0, list = []) {
   list.push({ ...node, parent, depth, childIds: node.children.map(c => c.id) });
   node.children.forEach(child => flatten(child, node, depth + 1, list));
   return list;
+}
+function normalizeSearch(value) {
+  return String(value ?? '').normalize('NFD').replace(/[\u0300-\u036f]/g, '').toLowerCase().trim();
+}
+function filterProcessTree(node, query, isRoot = true) {
+  const terms = normalizeSearch(query).split(/\s+/).filter(Boolean);
+  if (!terms.length) return node;
+
+  const filteredChildren = node.children
+    .map(child => filterProcessTree(child, query, false))
+    .filter(Boolean);
+  const haystack = normalizeSearch([
+    node.name,
+    node.user,
+    node.pid,
+    node.status,
+    node.lifecycle,
+    processStateText(node),
+  ].join(' '));
+  const matches = node.pid > 0 && terms.every(term => haystack.includes(term));
+  if (!isRoot && !matches && !filteredChildren.length) return null;
+
+  if (node.pid === 0) {
+    const cpu = Number(filteredChildren.reduce((sum, child) => sum + child.cpu, 0).toFixed(1));
+    const memory = filteredChildren.reduce((sum, child) => sum + child.memory, 0);
+    return {
+      ...node,
+      cpu,
+      memory: Math.max(1, memory),
+      threads: filteredChildren.reduce((sum, child) => sum + child.threads, 0),
+      children: filteredChildren,
+    };
+  }
+  return { ...node, children: filteredChildren };
 }
 function apiRowsToTree(rows) {
   if (!Array.isArray(rows) || !rows.length) return rawTree;
@@ -112,12 +149,17 @@ function apiRowsToTree(rows) {
         status: row.status === 'activo' || row.status === 'running' ? 'running' : 'sleeping',
         runtime: String(row.runtime || row.time || 'n/d'),
         threads: Number(row.threads || 1),
+        lifecycle: row.lifecycle || 'normal',
+        firstSeen: Number(row.firstSeen || 0),
+        closedAt: Number(row.closedAt || 0),
+        displayOrder: Number(row.displayOrder || 0),
         cpuHistory: [0, 0, 0, 0, 0, 0, Math.max(0, Number(cpu || 0))],
         memHistory: [Math.max(1, Math.round(memory))],
         children: [],
       };
     })
-    .filter(Boolean);
+    .filter(Boolean)
+    .sort((a, b) => a.displayOrder - b.displayOrder || a.pid - b.pid);
 
   normalized.forEach((process) => byPid.set(process.pid, process));
   const roots = [];
@@ -144,7 +186,13 @@ function apiRowsToTree(rows) {
   };
   return root.children.length ? root : rawTree;
 }
-function cpuColor(p) { if (p.status !== 'running') return '#666666'; if (p.cpu >= 80) return '#ff0000'; if (p.cpu >= 40) return '#ff9800'; return '#00ff88'; }
+function impactScore(p) {
+  const cpuPressure = Math.min(100, Math.max(0, p.cpu || 0));
+  const memoryPressure = Math.min(100, Math.max(0, (p.memory || 0) / 1024 * 100));
+  const threadPressure = Math.min(100, Math.max(0, (p.threads || 0) / 64 * 100));
+  return Math.round(cpuPressure * .35 + memoryPressure * .50 + threadPressure * .15);
+}
+function impactColor(p) { if (p.lifecycle === 'closed') return '#666666'; if (p.lifecycle === 'new') return '#168BFF'; const score = impactScore(p); if (score >= 50) return '#ff0000'; if (score >= 20) return '#ff9800'; return '#00ff88'; }
 function radius(memory) { return Math.max(21, Math.min(58, 15 + Math.sqrt(memory) * .72)); }
 const MIN_NODE_GAP = 12; // 0.1cm+ at default zoom, measured in graph world units.
 function subtreeSpan(node) {
@@ -177,7 +225,12 @@ function layout(node, x0 = 70, x1 = 1210, y = 82, depth = 0, out = [], parentId 
   });
   return out;
 }
-const stateText = { running:'En ejecución', sleeping:'En reposo', inactive:'Inactivo' };
+const stateText = { running:'En ejecución', sleeping:'Sin CPU en esta muestra', inactive:'Cerrado' };
+function processStateText(process) {
+  if (process.lifecycle === 'new') return 'Nuevo · azul durante 1 min';
+  if (process.lifecycle === 'closed') return 'Cerrado · visible durante 30 s';
+  return stateText[process.status] || 'Estado desconocido';
+}
 
 function Spark({ data, color, label }) {
   const w = 156, h = 48, max = Math.max(...data), min = Math.min(...data);
@@ -190,18 +243,40 @@ function Bars({ data, color }) { const max = Math.max(...data); return <div clas
 function ViewScreen({ section, processes, selected, totals, openNode }) {
   const topCpu = [...processes].sort((a,b)=>b.cpu-a.cpu).slice(0,6);
   const topMem = [...processes].sort((a,b)=>b.memory-a.memory).slice(0,6);
-  const risky = processes.filter(p => p.cpu >= 80 || p.memory >= 1800);
+  const risky = processes.filter(p => p.lifecycle !== 'closed' && impactScore(p) >= 20);
   const users = [...new Set(processes.map(p => p.user))].map(user => ({ user, count: processes.filter(p=>p.user===user).length, cpu: processes.filter(p=>p.user===user).reduce((s,p)=>s+p.cpu,0), mem: processes.filter(p=>p.user===user).reduce((s,p)=>s+p.memory,0) }));
-  if (section === 'Métricas') return <section className="screen"><div className="screen-hero"><p>Métricas</p><h2>Capacidad, presión y procesos dominantes</h2><span>Esta vista separa análisis de recursos del lienzo de topología para comparar sin perder contexto.</span></div><div className="screen-grid"><article className="card wide"><header><b>Top RSS por proceso</b><small>{totals.mem} GB observados</small></header>{topMem.map(p=><button className="rank" key={p.id} onClick={()=>openNode(p.id)}><span>{p.name}<small>{p.user} · {p.childIds.length ? `${p.childIds.length} hijos` : 'proceso hoja'}</small></span><b>{p.memory} MB</b><i style={{width:`${Math.min(100,p.memory/32)}%`, background:cpuColor(p)}} /></button>)}</article><article className="card"><header><b>Muestras de CPU</b><small>top 6</small></header><Bars data={topCpu.map(p=>p.cpu)} color="#ff9800"/><p className="note">Pico actual: {topCpu[0].name} con {topCpu[0].cpu}%.</p></article><article className="card"><header><b>Proceso seleccionado</b><small>lectura rápida</small></header><strong className="mega">{selected.memory} MB</strong><p className="note">{selected.name} · {selected.cpu}% CPU · {selected.threads} hilos</p></article></div></section>;
-  if (section === 'Alertas') return <section className="screen"><div className="screen-hero danger"><p>Alertas</p><h2>Incidentes priorizados por impacto operativo</h2><span>CPU crítica, RSS elevada y linajes que requieren inspección inmediata.</span></div><div className="alert-stack">{risky.map(p=><button className="alert" key={p.id} onClick={()=>openNode(p.id)}><i style={{background:cpuColor(p)}}/><span><b>{p.cpu >= 80 ? 'CPU crítica' : 'Memoria elevada'} · {p.name}</b><small>usuario {p.user} · padre {p.parent ? p.parent.name : 'ninguno'}</small></span><em>Inspeccionar</em></button>)}</div></section>;
+  if (section === 'Métricas') return <section className="screen"><div className="screen-hero"><p>Métricas</p><h2>Capacidad, presión y procesos dominantes</h2><span>Esta vista separa análisis de recursos del lienzo de topología para comparar sin perder contexto.</span></div><div className="screen-grid"><article className="card wide"><header><b>Top RSS por proceso</b><small>{totals.mem} GB observados</small></header>{topMem.map(p=><button className="rank" key={p.id} onClick={()=>openNode(p.id)}><span>{p.name}<small>{p.user} · impacto {impactScore(p)}/100</small></span><b>{p.memory} MB</b><i style={{width:`${Math.min(100,p.memory/32)}%`, background:impactColor(p)}} /></button>)}</article><article className="card"><header><b>Muestras de CPU</b><small>top 6</small></header><Bars data={topCpu.map(p=>p.cpu)} color="#ff9800"/><p className="note">Pico actual: {topCpu[0].name} con {topCpu[0].cpu}%.</p></article><article className="card"><header><b>Proceso seleccionado</b><small>impacto general</small></header><strong className="mega">{impactScore(selected)}/100</strong><p className="note">{selected.name} · {selected.cpu}% CPU · {selected.memory} MB · {selected.threads} hilos</p></article></div></section>;
+  if (section === 'Alertas') return <section className="screen"><div className="screen-hero danger"><p>Alertas</p><h2>Procesos con mayor impacto en el equipo</h2><span>Clasificación combinada de CPU, memoria RSS e hilos.</span></div><div className="alert-stack">{risky.sort((a,b)=>impactScore(b)-impactScore(a)).map(p=><button className="alert" key={p.id} onClick={()=>openNode(p.id)}><i style={{background:impactColor(p)}}/><span><b>Impacto {impactScore(p)}/100 · {p.name}</b><small>{p.cpu}% CPU · {p.memory} MB · {p.threads} hilos</small></span><em>Inspeccionar</em></button>)}</div></section>;
   if (section === 'Auditoría') return <section className="screen"><div className="screen-hero"><p>Auditoría</p><h2>Usuarios, linaje y procesos revisables</h2><span>Tabla operacional para detectar procesos no-root, sesiones y descendientes con exposición.</span></div><div className="audit"><div className="audit-head"><span>Usuario</span><span>Procesos</span><span>CPU total</span><span>RSS</span><span>Acción</span></div>{users.map(u=><button className="audit-row" key={u.user} onClick={()=>openNode(processes.find(p=>p.user===u.user).id)}><span>{u.user}</span><span>{u.count}</span><span>{u.cpu.toFixed(1)}%</span><span>{u.mem} MB</span><b>Ver linaje</b></button>)}</div></section>;
-  return <section className="screen"><div className="screen-hero"><p>Ajustes</p><h2>Preferencias del observatorio</h2><span>Configuración preparada para pasar de mock estático a telemetría real sin romper el lenguaje visual.</span></div><div className="settings"><article><span>Refresco</span><b>Simulado · 5 s</b><small>Listo para conectar a un stream local.</small></article><article><span>Umbral crítico</span><b>CPU ≥ 80%</b><small>Semántica fija de la leyenda.</small></article><article><span>Escalado de nodos</span><b>Raíz cuadrada de RSS</b><small>Evita solapamientos extremos.</small></article><article><span>Idioma</span><b>Español</b><small>Nombres técnicos preservados.</small></article></div></section>;
+  return <section className="screen"><div className="screen-hero"><p>Ajustes</p><h2>Preferencias del observatorio</h2><span>Configuración preparada para pasar de mock estático a telemetría real sin romper el lenguaje visual.</span></div><div className="settings"><article><span>Refresco</span><b>Automático · 1 s</b><small>Estados y colores se reinician sin recargar la página.</small></article><article><span>Impacto general</span><b>CPU 35% · RAM 50% · hilos 15%</b><small>Naranja desde 20; rojo desde 50.</small></article><article><span>Escalado de nodos</span><b>Raíz cuadrada de RSS</b><small>Evita solapamientos extremos.</small></article><article><span>Idioma</span><b>Español</b><small>Nombres técnicos preservados.</small></article></div></section>;
 }
 
 function App() {
   const [tree, setTree] = useState(rawTree);
-  const processes = useMemo(() => flatten(tree), [tree]);
-  const positions = useMemo(() => layout(tree), [tree]);
+  const processCache = useRef(new Map());
+  const positionCache = useRef(new Map());
+  const nextDisplayOrder = useRef(1);
+  const hasBaseline = useRef(false);
+  const [capacity, setCapacity] = useState({ cpuLogical: null, memoryGb: null, memoryUsedGb: null });
+  const [searchQuery, setSearchQuery] = useState('');
+  const visibleTree = useMemo(() => filterProcessTree(tree, searchQuery), [tree, searchQuery]);
+  const processes = useMemo(() => flatten(visibleTree), [visibleTree]);
+  const positions = useMemo(() => {
+    const currentIds = new Set();
+    const visibleProcessMap = Object.fromEntries(flatten(visibleTree).map(item => [item.id, item]));
+    const nextPositions = layout(visibleTree).map((position) => {
+      currentIds.add(position.id);
+      const process = visibleProcessMap[position.id];
+      const previous = positionCache.current.get(position.id);
+      const stable = process?.lifecycle === 'closed' && previous ? { ...position, x: previous.x, y: previous.y } : position;
+      positionCache.current.set(position.id, stable);
+      return stable;
+    });
+    positionCache.current.forEach((_, id) => {
+      if (!currentIds.has(id)) positionCache.current.delete(id);
+    });
+    return nextPositions;
+  }, [visibleTree]);
   const processMap = useMemo(() => Object.fromEntries(processes.map(p => [p.id, p])), [processes]);
   const positionMap = useMemo(() => Object.fromEntries(positions.map(p => [p.id, p])), [positions]);
   const [active, setActive] = useState('Topología');
@@ -211,8 +286,11 @@ function App() {
   const [view, setView] = useState({ x: 18, y: 82, scale: TWEAK_DEFAULTS.topologyZoom });
   const [drag, setDrag] = useState(null);
   const selected = processMap[selectedId] || processes[0];
-  const totals = { count: processes.length, active: processes.filter(p=>p.status==='running').length, sleeping: processes.filter(p=>p.status!=='running').length, cpu: processes.reduce((s,p)=>s+p.cpu,0).toFixed(1), mem: (processes.reduce((s,p)=>s+p.memory,0)/1024).toFixed(1) };
-  const titles = { Topología:'Topología jerárquica en tiempo de ejecución', Métricas:'Interfaz de métricas de capacidad', Alertas:'Centro de alertas de procesos', Auditoría:'Auditoría de usuarios y linaje', Ajustes:'Ajustes del observatorio' };
+  const realProcesses = processes.filter(p => p.pid > 0);
+  const currentProcesses = realProcesses.filter(p => p.lifecycle !== 'closed');
+  const processCpuTotal = currentProcesses.reduce((s,p)=>s+p.cpu,0);
+  const totals = { count: currentProcesses.length, active: currentProcesses.filter(p=>p.status==='running').length, sleeping: currentProcesses.filter(p=>p.status!=='running').length, cpu: Math.min(100, processCpuTotal / Math.max(1, capacity.cpuLogical || 1)).toFixed(1), mem: (currentProcesses.reduce((s,p)=>s+p.memory,0)/1024).toFixed(1) };
+  const titles = { Topología:'System Monitor Visual', Métricas:'Interfaz de métricas de capacidad', Alertas:'Centro de alertas de procesos', Auditoría:'Auditoría de usuarios y linaje', Ajustes:'Ajustes del observatorio' };
   const nav = ['Topología','Métricas','Alertas','Auditoría','Ajustes'];
   useEffect(() => {
     let cancelled = false;
@@ -221,9 +299,50 @@ function App() {
         const response = await fetch('/api/processes', { cache: 'no-store' });
         if (!response.ok) return;
         const payload = await response.json();
-        const nextTree = apiRowsToTree(payload.processes);
+        const now = Date.now();
+        const incoming = new Map((payload.processes || []).map(row => [Number(row.pid), row]));
+        const alivePids = new Set((payload.alive_pids || payload.processes?.map(row => row.pid) || []).map(Number));
+        const mergedRows = [];
+
+        incoming.forEach((row, pid) => {
+          const previous = processCache.current.get(pid);
+          const restarted = previous?.lifecycle === 'closed';
+          const firstSeen = previous && !restarted ? previous.firstSeen : now;
+          const staysNew = restarted || !previous || previous.lifecycle === 'new';
+          const lifecycle = hasBaseline.current && staysNew && now - firstSeen < NEW_PROCESS_MS ? 'new' : 'normal';
+          const displayOrder = previous?.displayOrder || nextDisplayOrder.current++;
+          const next = { ...row, firstSeen, closedAt: 0, lifecycle, displayOrder };
+          processCache.current.set(pid, next);
+          mergedRows.push(next);
+        });
+
+        processCache.current.forEach((previous, pid) => {
+          if (incoming.has(pid)) return;
+          if (alivePids.has(pid)) {
+            const retained = { ...previous, lifecycle: previous.lifecycle === 'new' && now - previous.firstSeen < NEW_PROCESS_MS ? 'new' : 'normal' };
+            processCache.current.set(pid, retained);
+            mergedRows.push(retained);
+            return;
+          }
+          const closedAt = previous.closedAt || now;
+          if (now - closedAt >= CLOSED_PROCESS_MS) {
+            processCache.current.delete(pid);
+            return;
+          }
+          const closed = { ...previous, cpu_percent: 0, status: 'inactivo', lifecycle: 'closed', closedAt };
+          processCache.current.set(pid, closed);
+          mergedRows.push(closed);
+        });
+
+        hasBaseline.current = true;
+        const nextTree = apiRowsToTree(mergedRows);
         if (!cancelled) {
           setTree(nextTree);
+          setCapacity({
+            cpuLogical: Number(payload.capacity?.cpu_logical || 0) || null,
+            memoryGb: Number(payload.capacity?.memory_gb || 0) || null,
+            memoryUsedGb: Number(payload.capacity?.memory_used_gb || 0) || null,
+          });
           setSelectedId((current) => current in Object.fromEntries(flatten(nextTree).map(p => [p.id, true])) ? current : nextTree.id);
           setNotice(`Procesos reales cargados · ${payload.source || 'api'} · ${nextTree.children.length} ramas`);
         }
@@ -232,7 +351,7 @@ function App() {
       }
     }
     loadProcesses();
-    const timer = setInterval(loadProcesses, 3000);
+    const timer = setInterval(loadProcesses, 1000);
     return () => { cancelled = true; clearInterval(timer); };
   }, []);
   function reset() { setView({ x:18, y:82, scale:TWEAK_DEFAULTS.topologyZoom }); }
@@ -253,8 +372,8 @@ function App() {
     <div className="app">
       <nav className="rail" aria-label="Navegación principal"><div className="mark">⌁</div>{nav.map((n,i)=><button key={n} className={`rail-btn ${active===n?'active':''}`} aria-label={`Abrir ${n}`} aria-pressed={active===n} title={n} onClick={()=>go(n)}>{['◌','▤','!','⌘','⚙'][i]}</button>)}</nav>
       <main className="main">
-        <header className="top"><div><p>Observatorio de procesos · prod-eu-west-03</p><h1>{titles[active]}</h1><span className="notice"><i/> {notice}</span></div><div className="actions"><input aria-label="Buscar proceso" placeholder="Buscar proceso, usuario, estado…"/><button onClick={()=>{reset();setActive('Topología');setNotice('Vista restablecida desde el control superior');}}>Restablecer vista</button></div></header>
-        <section className="stats" aria-label="Resumen"><Stat label="Uso total CPU" value={`${totals.cpu}%`} note="muestra agregada" tone="orange"/><Stat label="Uso total memoria" value={`${totals.mem} GB`} note="RSS acumulado" tone="green"/><Stat label="Activos" value={totals.active} note="running/listos" tone="cyan"/><Stat label="En reposo" value={totals.sleeping} note="sleeping/inactivos" tone="gray"/><Stat label="Total procesos" value={totals.count} note="árbol completo" tone="red"/></section>
+        <header className="top"><div><p>Observatorio de procesos · prod-eu-west-03</p><h1>{titles[active]}</h1><span className="notice"><i/> {searchQuery ? `${realProcesses.length} resultado${realProcesses.length === 1 ? '' : 's'} para “${searchQuery}”` : notice}</span></div><div className="actions"><input aria-label="Buscar proceso" placeholder="Buscar proceso, usuario, PID o estado…" value={searchQuery} onChange={(event)=>{setSearchQuery(event.target.value);setActive('Topología');reset();}}/><button onClick={()=>{setSearchQuery('');reset();setActive('Topología');setNotice('Vista restablecida desde el control superior');}}>Restablecer vista</button></div></header>
+        <section className="stats" aria-label="Resumen"><Stat label="CPU actual" value={`${totals.cpu}%${capacity.cpuLogical ? ` / ${capacity.cpuLogical} hilos` : ''}`} note="uso / hilos lógicos" tone="orange"/><Stat label="Memoria actual" value={`${capacity.memoryUsedGb ?? totals.mem}${capacity.memoryGb ? ` / ${capacity.memoryGb}` : ''} GB`} note="usada / instalada" tone="green"/><Stat label="Procesos vivos" value={totals.count} note="detectados ahora" tone="cyan"/><Stat label="Impacto medio" value={currentProcesses.filter(p=>impactScore(p)>=20 && impactScore(p)<50).length} note="20–49 puntos" tone="orange"/><Stat label="Impacto alto" value={currentProcesses.filter(p=>impactScore(p)>=50).length} note="50–100 puntos" tone="red"/></section>
         {active === 'Topología' ? <section className="workspace">
           <div className={`graph ${drag?'dragging':''}`} onWheel={onWheel} onPointerDown={onDown} onPointerMove={onMove} onPointerUp={()=>setDrag(null)} onPointerLeave={()=>setDrag(null)}>
             <div className="aurora"/><div className="particles"><i/><i/><i/><i/><i/></div>
@@ -262,16 +381,16 @@ function App() {
               <svg className="topology" viewBox="0 0 1280 830" aria-hidden="true">
                 {[1,2,3,4].map(d=><ellipse key={d} className="ring" cx="640" cy={86+d*158} rx={245+d*82} ry={40+d*7}/>)}
                 <path className="lane" d="M640 92 C440 205 330 308 230 490 C180 580 140 646 92 742"/><path className="lane" d="M640 92 C800 210 910 320 1040 486 C1100 560 1160 646 1214 742"/><path className="lane" d="M640 92 C628 230 650 360 648 520 C646 616 642 688 640 768"/>
-                {positions.filter(p=>p.parentId).map(pos=>{ const parent=positionMap[pos.parentId], child=processMap[pos.id], parentProc=processMap[pos.parentId]; const mid=(parent.y+pos.y)/2; const d=`M ${parent.x} ${parent.y+radius(parentProc.memory)} C ${parent.x} ${mid-24}, ${pos.x} ${mid+24}, ${pos.x} ${pos.y-radius(child.memory)}`; const hot = hovered===pos.id || hovered===pos.parentId || selectedId===pos.id || selectedId===pos.parentId; return <path key={pos.id} className={`edge ${hot?'hot':''}`} style={{'--c':cpuColor(child)}} d={d}/>; })}
+                {positions.filter(p=>p.parentId).map(pos=>{ const parent=positionMap[pos.parentId], child=processMap[pos.id], parentProc=processMap[pos.parentId]; const mid=(parent.y+pos.y)/2; const d=`M ${parent.x} ${parent.y+radius(parentProc.memory)} C ${parent.x} ${mid-24}, ${pos.x} ${mid+24}, ${pos.x} ${pos.y-radius(child.memory)}`; const hot = hovered===pos.id || hovered===pos.parentId || selectedId===pos.id || selectedId===pos.parentId; return <path key={pos.id} className={`edge ${hot?'hot':''}`} style={{'--c':impactColor(child)}} d={d}/>; })}
               </svg>
-              {positions.map(pos=>{ const p=processMap[pos.id], r=radius(p.memory), c=cpuColor(p); return <div key={p.id} className="node-wrap" style={{left:`calc(50% - 640px + ${pos.x}px)`, top:`calc(50% - 415px + ${pos.y}px)`}} onMouseEnter={()=>setHovered(p.id)} onMouseLeave={()=>setHovered(null)}><button className={`node ${selectedId===p.id?'selected':''}`} style={{width:r*2, height:r*2, '--c':c}} onClick={(e)=>{e.stopPropagation();setSelectedId(p.id);setNotice(`Seleccionado ${p.name}`);}}><span>{p.name}</span><em>{p.cpu}% · {p.memory}M</em></button>{hovered===p.id && <div className="tip"><b>{p.name}</b><span>{p.childIds.length ? `${p.childIds.length} procesos hijos` : 'proceso hoja'}</span><span>{p.cpu}% CPU</span><span>{p.memory} MB RSS</span><span>{stateText[p.status]}</span></div>}</div>; })}
+              {positions.map(pos=>{ const p=processMap[pos.id], r=radius(p.memory), c=impactColor(p); return <div key={p.id} className="node-wrap" style={{left:`calc(50% - 640px + ${pos.x}px)`, top:`calc(50% - 415px + ${pos.y}px)`}} onMouseEnter={()=>setHovered(p.id)} onMouseLeave={()=>setHovered(null)}><button className={`node ${selectedId===p.id?'selected':''}`} style={{width:r*2, height:r*2, '--c':c}} onClick={(e)=>{e.stopPropagation();setSelectedId(p.id);setNotice(`Seleccionado ${p.name}`);}}><span>{p.name}</span><em>{impactScore(p)}/100 · {p.memory}M</em></button>{hovered===p.id && <div className="tip"><b>{p.name}</b><span>Impacto {impactScore(p)}/100</span><span>{p.cpu}% CPU</span><span>{p.memory} MB RSS · {p.threads} hilos</span><span>{processStateText(p)}</span></div>}</div>; })}
             </div>
             <div className="hud"><span>Rueda: zoom · arrastrar: paneo</span><b>{Math.round(view.scale*100)}%</b></div>
           </div>
-          <aside className="legend"><div><h2>Leyenda de señales</h2>{[['CPU alta 80%+','#ff0000'],['CPU media 40–80%','#ff9800'],['CPU baja <40%','#00ff88'],['En reposo / inactivo','#666666']].map(([l,c])=><p key={l}><i style={{background:c}}/>{l}</p>)}</div><div><h2>Tamaño por memoria</h2><div className="sizes"><i/><i/><i/><b>RSS define el diámetro del círculo</b></div></div><div><h2>Distribución</h2><small>Rutas curvas desde systemd hacia ramas descendientes equilibradas. Los halos brillantes indican selección o cursor.</small></div></aside>
+          <aside className="legend"><div><h2>Leyenda de impacto</h2>{[['Proceso nuevo · 1 min','#168BFF'],['Impacto alto · 50–100','#ff0000'],['Impacto medio · 20–49','#ff9800'],['Impacto bajo · 0–19','#00ff88'],['Proceso cerrado · 30 s','#666666']].map(([l,c])=><p key={l}><i style={{background:c}}/>{l}</p>)}</div><div><h2>Tamaño por memoria</h2><div className="sizes"><i/><i/><i/><b>RSS define el diámetro del círculo</b></div></div><div><h2>Cálculo</h2><small>Impacto = 35% CPU + 50% memoria RSS + 15% cantidad de hilos.</small></div></aside>
         </section> : <ViewScreen section={active} processes={processes} selected={selected} totals={totals} openNode={openNode}/>} 
       </main>
-      <aside className="panel" aria-label="Detalles del proceso seleccionado"><header><div><h2>{selected.name}</h2><p>padre {selected.parent ? selected.parent.name : 'ninguno'}</p></div><span className={selected.status}>{stateText[selected.status]}</span></header><div className="details"><p><span>Usuario</span><b>{selected.user}</b></p><p><span>CPU</span><b>{selected.cpu}%</b></p><p><span>Memoria</span><b>{selected.memory} MB</b></p><p><span>Tiempo</span><b>{selected.runtime}</b></p><p><span>Hilos</span><b>{selected.threads}</b></p><p><span>ID técnico</span><b>{selected.pid}</b></p></div><article className="chart"><header><b>Historial CPU</b><small>últimas 8 muestras</small></header><Spark data={selected.cpuHistory} color={cpuColor(selected)} label="historial de CPU"/></article><article className="chart"><header><b>Historial memoria</b><small>RSS · MB</small></header><Spark data={selected.memHistory} color="#27D7FF" label="historial de memoria"/></article><h3>Procesos hijos</h3><div className="chips">{selected.childIds.length ? selected.childIds.map(id=><button key={id} onClick={()=>setSelectedId(id)}>{processMap[id].name}</button>) : <span>proceso hoja</span>}</div><div className="insight"><b>Nota:</b> {selected.cpu >= 80 ? 'CPU sobre umbral crítico; revisa descendientes y contención.' : selected.memory > 1800 ? 'RSS elevado frente a procesos hermanos; vigila tendencia.' : 'Perfil dentro de márgenes operativos esperados.'}</div></aside>
+      <aside className="panel" aria-label="Detalles del proceso seleccionado"><header><div><h2>{selected.name}</h2><p>padre {selected.parent ? selected.parent.name : 'ninguno'}</p></div><span className={selected.status}>{processStateText(selected)}</span></header><div className="details"><p><span>Impacto</span><b>{impactScore(selected)}/100</b></p><p><span>CPU</span><b>{selected.cpu}%</b></p><p><span>Memoria</span><b>{selected.memory} MB</b></p><p><span>Tiempo</span><b>{selected.runtime}</b></p><p><span>Hilos</span><b>{selected.threads}</b></p><p><span>ID técnico</span><b>{selected.pid}</b></p></div><article className="chart"><header><b>Historial CPU</b><small>últimas 8 muestras</small></header><Spark data={selected.cpuHistory} color={impactColor(selected)} label="historial de CPU"/></article><article className="chart"><header><b>Historial memoria</b><small>RSS · MB</small></header><Spark data={selected.memHistory} color="#27D7FF" label="historial de memoria"/></article><h3>Procesos hijos</h3><div className="chips">{selected.childIds.length ? selected.childIds.map(id=><button key={id} onClick={()=>setSelectedId(id)}>{processMap[id].name}</button>) : <span>proceso hoja</span>}</div><div className="insight"><b>Nota:</b> {impactScore(selected) >= 50 ? 'Impacto alto por combinación de CPU, memoria e hilos.' : impactScore(selected) >= 20 ? 'Impacto medio; conviene vigilar su consumo sostenido.' : 'Impacto bajo sobre el equipo en esta muestra.'}</div></aside>
     </div>
   </>;
 }
@@ -281,3 +400,4 @@ const css = `
 `;
 
 ReactDOM.createRoot(document.getElementById('root')).render(<App />);
+

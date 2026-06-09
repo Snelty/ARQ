@@ -5,9 +5,12 @@ El endpoint /api/processes lee el JSON generado por bash.md en /tmp/processes.js
 """
 
 import json
+import os
 from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 import webbrowser
+
+from backend.server import system_capacity, windows_process_snapshot
 
 ROOT = Path(__file__).resolve().parent
 STATIC_DIR = ROOT / "static"
@@ -53,7 +56,10 @@ class DashboardHandler(SimpleHTTPRequestHandler):
                 payload = json.loads(PROCESS_FILE.read_text(encoding="utf-8"))
             except (OSError, json.JSONDecodeError):
                 payload["source"] = "invalid-process-file"
+        elif os.name == "nt":
+            payload = windows_process_snapshot() or payload
 
+        payload["capacity"] = system_capacity()
         data = json.dumps(payload).encode("utf-8")
         self.send_response(200)
         self.send_header("Content-Type", "application/json; charset=utf-8")

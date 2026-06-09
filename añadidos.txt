@@ -1,4 +1,4 @@
 - Añadir nuevos procesos
 - Tiempo del proceso en gris
 - Tablas de tiempo de vida (tipo gestion de monoprocesador)
-- 
+

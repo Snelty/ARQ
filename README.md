@@ -10,7 +10,9 @@ En Linux/WSL, ejecuta:
 bash bash.md
 ```
 
-Ese comando inicia el recolector, levanta `backend/server.py` si hace falta y abre `http://127.0.0.1:8000`.
+Ese comando inicia el recolector, levanta `backend/server.py` si hace falta y abre `http://127.0.0.1:8765`.
+
+Linux empieza en el puerto `8765` para no confundirse con `app.py` de Windows, que usa el `8000`. Si está ocupado, busca automáticamente el siguiente puerto libre.
 
 ## Comandos utiles
 

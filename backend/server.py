@@ -1,6 +1,7 @@
 import json
 import os
 import subprocess
+import threading
 import time
 import ctypes
 from ctypes import wintypes
@@ -11,9 +12,49 @@ BACKEND_DIR = Path(__file__).resolve().parent
 ROOT = BACKEND_DIR.parent
 STATIC_DIR = ROOT / "static"
 INDEX_FILE = ROOT / "index.html"
-PROCESS_FILE = Path("/tmp/processes.json")
-HOST = "127.0.0.1"
-PORT = 8000
+PROCESS_FILE = Path(os.environ.get("PROCESS_FILE", "/tmp/processes.json"))
+HOST = os.environ.get("HOST", "127.0.0.1")
+PORT = int(os.environ.get("PORT", "8000"))
+_process_sample_lock = threading.Lock()
+_previous_process_cpu = {}
+_previous_sample_time = None
+
+
+def system_capacity():
+    memory_bytes = 0
+    available_bytes = 0
+    if os.name == "nt":
+        class MEMORYSTATUSEX(ctypes.Structure):
+            _fields_ = [
+                ("dwLength", wintypes.DWORD),
+                ("dwMemoryLoad", wintypes.DWORD),
+                ("ullTotalPhys", ctypes.c_ulonglong),
+                ("ullAvailPhys", ctypes.c_ulonglong),
+                ("ullTotalPageFile", ctypes.c_ulonglong),
+                ("ullAvailPageFile", ctypes.c_ulonglong),
+                ("ullTotalVirtual", ctypes.c_ulonglong),
+                ("ullAvailVirtual", ctypes.c_ulonglong),
+                ("ullAvailExtendedVirtual", ctypes.c_ulonglong),
+            ]
+
+        status = MEMORYSTATUSEX()
+        status.dwLength = ctypes.sizeof(MEMORYSTATUSEX)
+        if ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(status)):
+            memory_bytes = int(status.ullTotalPhys)
+            available_bytes = int(status.ullAvailPhys)
+    else:
+        try:
+            memory_bytes = os.sysconf("SC_PAGE_SIZE") * os.sysconf("SC_PHYS_PAGES")
+            available_bytes = os.sysconf("SC_PAGE_SIZE") * os.sysconf("SC_AVPHYS_PAGES")
+        except (AttributeError, OSError, ValueError):
+            memory_bytes = 0
+            available_bytes = 0
+
+    return {
+        "cpu_logical": os.cpu_count() or 0,
+        "memory_gb": round(memory_bytes / 1024 ** 3, 1) if memory_bytes else 0,
+        "memory_used_gb": round((memory_bytes - available_bytes) / 1024 ** 3, 1) if memory_bytes else 0,
+    }
 
 
 def windows_parent_process_map():
@@ -68,6 +109,8 @@ def windows_parent_process_map():
 
 
 def windows_process_snapshot():
+    global _previous_process_cpu, _previous_sample_time
+
     parent_by_pid = windows_parent_process_map()
     command = r"""
 $ErrorActionPreference = 'SilentlyContinue'
@@ -102,27 +145,46 @@ Get-Process |
 
     rows = raw if isinstance(raw, list) else [raw]
     processes = []
+    sample_time = time.perf_counter()
+    with _process_sample_lock:
+        previous_cpu = _previous_process_cpu
+        previous_time = _previous_sample_time
+        elapsed = sample_time - previous_time if previous_time is not None else 0
+        current_cpu = {}
+
     for row in rows:
         pid = row.get("Id")
         if not isinstance(pid, int):
             continue
         cpu_total = float(row.get("CPU") or 0)
+        current_cpu[pid] = cpu_total
+        cpu_delta = max(0, cpu_total - previous_cpu.get(pid, cpu_total))
+        # A process using one logical core fully is 100%. This scale matches
+        # the 40% and 80% color thresholds used by the dashboard.
+        cpu_percent = cpu_delta / elapsed * 100 if elapsed > 0 else 0
         memory_mb = round(float(row.get("WorkingSet64") or 0) / 1024 / 1024, 1)
         processes.append({
             "pid": pid,
             "ppid": parent_by_pid.get(pid, 0),
             "name": row.get("ProcessName") or f"pid-{pid}",
             "user": os.environ.get("USERNAME") or "windows",
-            "cpu_percent": round(min(100, cpu_total), 1),
+            "cpu_percent": round(min(100, cpu_percent), 1),
             "memory_mb": memory_mb,
-            "status": "activo" if cpu_total > 0 else "reposo",
+            # If Get-Process returned it, the process still exists. CPU can be
+            # zero during this sample without meaning the process is closed.
+            "status": "activo",
             "threads": int(row.get("Threads") or 1),
             "runtime": row.get("Runtime") or "n/d",
         })
 
+    with _process_sample_lock:
+        _previous_process_cpu = current_cpu
+        _previous_sample_time = sample_time
+
     return {
         "timestamp": int(time.time()),
         "source": "windows-get-process+toolhelp-parents",
+        "alive_pids": list(parent_by_pid),
         "processes": processes,
     }
 
@@ -164,6 +226,7 @@ class ProcessDashboardHandler(SimpleHTTPRequestHandler):
         elif os.name == "nt":
             payload = windows_process_snapshot() or payload
 
+        payload["capacity"] = system_capacity()
         data = json.dumps(payload).encode("utf-8")
         self.send_response(200)
         self.send_header("Content-Type", "application/json; charset=utf-8")
